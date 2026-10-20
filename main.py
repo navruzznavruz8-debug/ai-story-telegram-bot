@@ -41,6 +41,8 @@ def story(message):
 @bot.message_handler(content_types=["photo"])
 def photo(message):
     bot.reply_to(message, "Rasmingiz qabul qilindi!")
-
+@bot.message_handler(commands=["video"])
+def video(message):
+    bot.reply_to(message, "Video funksiyasini hozir sozlayapmiz! 🎬")
 threading.Thread(target=start_server, daemon=True).start()
 bot.infinity_polling()
