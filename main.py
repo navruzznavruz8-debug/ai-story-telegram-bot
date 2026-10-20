@@ -1,574 +1,208 @@
-import os
-import io
-import time
-import math
-import random
+"""
+Telegram AI Video Bot
+Mavzu -> hikoya (Claude) -> rasm (Pollinations) -> ovoz (edge-tts) -> video (ffmpeg)
+"""
+import asyncio
+import json
 import logging
-import threading
+import os
+import re
+import shutil
+import subprocess
 import tempfile
+from pathlib import Path
+from urllib.parse import quote
 
-import telebot
-from telebot import types
-from PIL import Image, ImageDraw, ImageFont
-from gtts import gTTS
-from moviepy.editor import (
-    ImageClip,
-    AudioFileClip,
-    concatenate_videoclips,
-)
+import aiohttp
+import edge_tts
+from aiogram import Bot, Dispatcher
+from aiogram.filters import Command, CommandStart
+from aiogram.types import FSInputFile, Message
+from anthropic import AsyncAnthropic
+from dotenv import load_dotenv
 
-# ==============================
-# SOZLAMALAR
-# ==============================
+load_dotenv()
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("storybot")
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-5-5")
+SCENES = int(os.getenv("SCENES", "5"))
+WIDTH, HEIGHT = 720, 1280  # 9:16 (Telegram/Reels/Shorts uchun)
+FPS = 25
 
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN Render Environment bo'limida topilmadi.")
+LANGS = {
+    "uz": {"name": "Uzbek (Latin script)", "voice": "uz-UZ-MadinaNeural"},
+    "ru": {"name": "Russian", "voice": "ru-RU-SvetlanaNeural"},
+    "en": {"name": "English", "voice": "en-US-AriaNeural"},
+}
+user_lang: dict[int, str] = {}
 
-bot = telebot.TeleBot(BOT_TOKEN, threaded=True)
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s"
-)
-
-# Har bir foydalanuvchining alohida loyihasi
-sessions = {}
-sessions_lock = threading.RLock()
-
-# Vaqtinchalik fayllarni saqlash joyi
-WORK_DIR = tempfile.gettempdir()
-
-
-def new_session():
-    return {
-        "story": "",
-        "photos": [],
-        "waiting": None,
-        "music": False,
-        "voice": True,
-        "busy": False,
-    }
+claude = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+dp = Dispatcher()
+job_limit = asyncio.Semaphore(2)  # bir vaqtda 2 ta video
 
 
-def get_session(user_id):
-    with sessions_lock:
-        if user_id not in sessions:
-            sessions[user_id] = new_session()
-        return sessions[user_id]
+# ---------- 1. HIKOYA ----------
+async def make_story(topic: str, lang: str) -> dict:
+    prompt = f"""Write a short, engaging story for a video about: "{topic}".
+Split it into exactly {SCENES} scenes. Each scene's narration should be 1-3 sentences.
+Narration language: {LANGS[lang]['name']}.
+For each scene also write "image_prompt": a vivid visual description IN ENGLISH
+(consistent characters and art style across scenes, no text in the image).
 
-
-def reset_session(user_id):
-    with sessions_lock:
-        sessions[user_id] = new_session()
-
-
-# ==============================
-# MENYU
-# ==============================
-
-def main_menu():
-    markup = types.ReplyKeyboardMarkup(
-        resize_keyboard=True,
-        row_width=2
+Reply with ONLY valid JSON, no other text:
+{{"title": "...", "scenes": [{{"narration": "...", "image_prompt": "..."}}]}}"""
+    resp = await claude.messages.create(
+        model=CLAUDE_MODEL,
+        max_tokens=2000,
+        messages=[{"role": "user", "content": prompt}],
     )
+    text = resp.content[0].text
+    match = re.search(r"\{.*\}", text, re.S)
+    data = json.loads(match.group(0))
+    if not data.get("scenes"):
+        raise ValueError("Hikoya bo'sh qaytdi")
+    return data
 
-    markup.add(
-        types.KeyboardButton("🧠 AI hikoya"),
-        types.KeyboardButton("🖼 Rasmlar"),
-        types.KeyboardButton("🎬 Video yaratish"),
-        types.KeyboardButton("🎙 Ovoz yaratish"),
-        types.KeyboardButton("📋 Loyiha holati"),
-        types.KeyboardButton("🆕 Yangi loyiha"),
+
+# ---------- 2. RASM ----------
+async def make_image(session: aiohttp.ClientSession, prompt: str, path: Path, seed: int):
+    url = (
+        f"https://image.pollinations.ai/prompt/{quote(prompt)}"
+        f"?width={WIDTH}&height={HEIGHT}&nologo=true&seed={seed}"
     )
-
-    return markup
-
-
-def send_home(chat_id):
-    bot.send_message(
-        chat_id,
-        "🚀 AI Story Studio Pro\n\n"
-        "Men hikoya yozish, rasmlarni birlashtirish "
-        "va ovozli video tayyorlashga yordam beraman.\n\n"
-        "Quyidagi menyudan kerakli bo‘limni tanlang.",
-        reply_markup=main_menu()
-    )
-
-
-# ==============================
-# /START — YANGI LOYIHA
-# ==============================
-
-@bot.message_handler(commands=["start"])
-def start(message):
-    reset_session(message.from_user.id)
-    send_home(message.chat.id)
-
-
-@bot.message_handler(commands=["help"])
-def help_command(message):
-    bot.reply_to(
-        message,
-        "📌 Buyruqlar:\n\n"
-        "/start — yangi loyiha\n"
-        "/help — yordam\n\n"
-        "Avval hikoya yuboring yoki AI hikoya bo‘limini tanlang. "
-        "Keyin rasmlarni yuboring va video yarating."
-    )
-
-
-# ==============================
-# AI HIKOYA
-# ==============================
-
-def create_story(prompt):
-    """
-    Hozircha bepul, mahalliy hikoya generatori.
-    Bu haqiqiy katta til modeli emas.
-    Keyinchalik AI API bilan almashtirish mumkin.
-    """
-
-    prompt = prompt.strip()
-
-    if not prompt:
-        return "Hikoya mavzusini yozing."
-
-    templates = [
-        (
-            "Bir kuni {topic} bilan bog‘liq g‘aroyib voqea yuz berdi. "
-            "Dastlab hech kim bu voqeaning qanchalik muhimligini anglamadi. "
-            "Ammo vaqt o‘tishi bilan hammasi o‘zgara boshladi. "
-            "Qahramonimiz qiyinchiliklardan qo‘rqmay, haqiqatni izlashga "
-            "qaror qildi. Yo‘lda u kutilmagan sinovlarga duch keldi. "
-            "Har bir sinov unga yangi saboq berdi. Oxir-oqibat, "
-            "u jasorat va ishonch yordamida o‘z maqsadiga erishdi."
-        ),
-        (
-            "{topic} haqidagi voqea oddiy bir kundan boshlandi. "
-            "Qahramonimiz oldida katta imkoniyat paydo bo‘ldi, "
-            "lekin bu imkoniyat osonlik bilan qo‘lga kiritilmasdi. "
-            "U reja tuzdi, xatolaridan saboq oldi va harakat qilishda "
-            "davom etdi. Kutilmagan uchrashuv uning fikrlarini o‘zgartirdi. "
-            "Shunda u eng muhim narsa sabr, bilim va qat’iyat ekanini "
-            "tushundi. Voqea esa unutilmas yakun bilan tugadi."
-        ),
-    ]
-
-    return random.choice(templates).format(topic=prompt)
-
-
-@bot.message_handler(
-    func=lambda m: m.text == "🧠 AI hikoya"
-)
-def story_button(message):
-    get_session(message.from_user.id)["waiting"] = "story"
-
-    bot.send_message(
-        message.chat.id,
-        "🧠 Hikoya mavzusini yozing.\n\n"
-        "Masalan: kelajakdagi shahar, do‘stlik, sarguzasht."
-    )
-
-
-@bot.message_handler(
-    func=lambda m: m.text == "🖼 Rasmlar"
-)
-def photos_button(message):
-    session = get_session(message.from_user.id)
-
-    bot.send_message(
-        message.chat.id,
-        f"🖼 Hozirgi loyihada {len(session['photos'])} ta rasm bor.\n\n"
-        "Yangi rasmlarni shu chatga yuboring. "
-        "Ular faqat joriy loyihaga qo‘shiladi."
-    )
-
-
-@bot.message_handler(
-    func=lambda m: m.text == "📋 Loyiha holati"
-)
-def status_button(message):
-    session = get_session(message.from_user.id)
-
-    story = session["story"]
-    story_status = "Bor ✅" if story else "Yo‘q"
-
-    bot.send_message(
-        message.chat.id,
-        "📋 LOYIHA HOLATI\n\n"
-        f"📖 Hikoya: {story_status}\n"
-        f"🖼 Rasmlar: {len(session['photos'])} ta\n"
-        f"🎙 Ovoz: {'Yoqilgan' if session['voice'] else 'O‘chirilgan'}\n"
-        f"🎵 Musiqa: {'Yoqilgan' if session['music'] else 'O‘chirilgan'}"
-    )
-
-
-@bot.message_handler(
-    func=lambda m: m.text == "🆕 Yangi loyiha"
-)
-def new_project_button(message):
-    reset_session(message.from_user.id)
-
-    bot.send_message(
-        message.chat.id,
-        "🆕 Yangi loyiha yaratildi!\n"
-        "Eski hikoya va rasmlar yangi loyihaga qo‘shilmaydi.",
-        reply_markup=main_menu()
-    )
-
-
-# ==============================
-# HIKOYA VA MATN QABUL QILISH
-# ==============================
-
-@bot.message_handler(
-    content_types=["text"],
-    func=lambda m: bool(
-        m.text
-        and not m.text.startswith("/")
-        and m.text not in [
-            "🧠 AI hikoya",
-            "🖼 Rasmlar",
-            "🎬 Video yaratish",
-            "🎙 Ovoz yaratish",
-            "📋 Loyiha holati",
-            "🆕 Yangi loyiha",
-        ]
-    )
-)
-def receive_text(message):
-    user_id = message.from_user.id
-    session = get_session(user_id)
-
-    waiting = session["waiting"]
-
-    if waiting == "story":
-        story = create_story(message.text)
-        session["story"] = story
-        session["waiting"] = None
-
-        bot.send_message(
-            message.chat.id,
-            "📖 Hikoya tayyor!\n\n" + story,
-            reply_markup=main_menu()
-        )
-        return
-
-    # Oddiy yuborilgan matnni hikoya sifatida saqlash
-    session["story"] = message.text.strip()
-    session["waiting"] = None
-
-    bot.send_message(
-        message.chat.id,
-        "📖 Matn hikoya sifatida saqlandi!\n"
-        "Endi rasmlarni yuborishingiz mumkin.",
-        reply_markup=main_menu()
-    )
-
-
-# ==============================
-# RASMLARNI QABUL QILISH
-# ==============================
-
-@bot.message_handler(content_types=["photo"])
-def receive_photo(message):
-    user_id = message.from_user.id
-    session = get_session(user_id)
-
-    if session["busy"]:
-        bot.reply_to(
-            message,
-            "⏳ Hozir video tayyorlanmoqda. Biroz kuting."
-        )
-        return
-
-    try:
-        photo = message.photo[-1]
-        file_info = bot.get_file(photo.file_id)
-        downloaded = bot.download_file(file_info.file_path)
-
-        filename = os.path.join(
-            WORK_DIR,
-            f"story_{user_id}_{time.time_ns()}.jpg"
-        )
-
-        with open(filename, "wb") as file:
-            file.write(downloaded)
-
-        # Rasm joriy foydalanuvchining loyihasiga qo‘shiladi
-        session["photos"].append(filename)
-
-        bot.reply_to(
-            message,
-            f"✅ Rasm saqlandi!\n"
-            f"Joriy loyihadagi rasmlar: {len(session['photos'])} ta."
-        )
-
-    except Exception:
-        logging.exception("Rasmni yuklashda xatolik")
-        bot.reply_to(
-            message,
-            "❌ Rasmni saqlashda xatolik yuz berdi. Qayta yuboring."
-        )
-
-
-# ==============================
-# VIDEO YARATISH
-# ==============================
-
-def create_video(story, photo_paths, add_voice):
-    """
-    Rasmlardan MP4 video yaratadi.
-    Agar ovoz yoqilgan bo‘lsa, hikoya TTS orqali o‘qiladi.
-    """
-
-    if not photo_paths:
-        raise ValueError("Avval kamida bitta rasm yuboring.")
-
-    temp_files = []
-    clips = []
-    audio_clip = None
-    final_clip = None
-
-    try:
-        # Rasmlarni bir xil o‘lchamga tayyorlash
-        prepared_images = []
-
-        for path in photo_paths:
-            with Image.open(path) as img:
-                img = img.convert("RGB")
-                img.thumbnail((1280, 720))
-
-                background = Image.new(
-                    "RGB",
-                    (1280, 720),
-                    (15, 15, 25)
-                )
-
-                x = (1280 - img.width) // 2
-                y = (720 - img.height) // 2
-
-                background.paste(img, (x, y))
-
-                prepared = os.path.join(
-                    WORK_DIR,
-                    f"prepared_{time.time_ns()}.jpg"
-                )
-
-                background.save(prepared, quality=90)
-                temp_files.append(prepared)
-                prepared_images.append(prepared)
-
-        # Har bir rasm taxminan 3 soniya ko‘rsatiladi
-        for path in prepared_images:
-            clip = ImageClip(path).set_duration(3)
-            clips.append(clip)
-
-        final_clip = concatenate_videoclips(
-            clips,
-            method="compose"
-        )
-
-        # Hikoyani ovozga aylantirish
-        if add_voice and story.strip():
-            voice_path = os.path.join(
-                WORK_DIR,
-                f"voice_{time.time_ns()}.mp3"
-            )
-
-            tts = gTTS(text=story[:4000], lang="uz")
-            tts.save(voice_path)
-            temp_files.append(voice_path)
-
-            audio_clip = AudioFileClip(voice_path)
-
-            # Video ovozdan qisqa bo‘lsa, oxirgi kadrni ushlab turish
-            if audio_clip.duration > final_clip.duration:
-                extra = audio_clip.duration - final_clip.duration
-
-                last_frame = ImageClip(
-                    prepared_images[-1]
-                ).set_duration(extra)
-
-                clips.append(last_frame)
-
-                final_clip.close()
-                final_clip = concatenate_videoclips(
-                    clips,
-                    method="compose"
-                )
-
-            final_clip = final_clip.set_audio(audio_clip)
-
-        output_path = os.path.join(
-            WORK_DIR,
-            f"video_{time.time_ns()}.mp4"
-        )
-
-        final_clip.write_videofile(
-            output_path,
-            fps=24,
-            codec="libx264",
-            audio_codec="aac",
-            logger=None,
-            preset="ultrafast"
-        )
-
-        return output_path
-
-    finally:
-        if audio_clip:
-            try:
-                audio_clip.close()
-            except Exception:
-                pass
-
-        if final_clip:
-            try:
-                final_clip.close()
-            except Exception:
-                pass
-
-        for clip in clips:
-            try:
-                clip.close()
-            except Exception:
-                pass
-
-        for path in temp_files:
-            try:
-                if os.path.exists(path):
-                    os.remove(path)
-            except Exception:
-                pass
-
-
-def generate_video_for_user(chat_id, user_id):
-    session = get_session(user_id)
-
-    if session["busy"]:
-        bot.send_message(chat_id, "⏳ Video allaqachon tayyorlanmoqda.")
-        return
-
-    if not session["photos"]:
-        bot.send_message(
-            chat_id,
-            "🖼 Avval video uchun rasmlar yuboring."
-        )
-        return
-
-    session["busy"] = True
-
-    try:
-        bot.send_message(
-            chat_id,
-            "🎬 Video tayyorlanmoqda. Iltimos, kuting..."
-        )
-
-        output = create_video(
-            session["story"],
-            list(session["photos"]),
-            session["voice"]
-        )
-
-        with open(output, "rb") as video_file:
-            bot.send_video(
-                chat_id,
-                video_file,
-                caption="🎬 Videongiz tayyor!"
-            )
-
+    for attempt in range(3):
         try:
-            os.remove(output)
-        except OSError:
-            pass
-
-    except Exception:
-        logging.exception("Video yaratishda xatolik")
-
-        bot.send_message(
-            chat_id,
-            "❌ Video yaratishda xatolik yuz berdi.\n"
-            "Rasmlarni tekshiring va qayta urinib ko‘ring."
-        )
-
-    finally:
-        session["busy"] = False
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=120)) as r:
+                if r.status == 200:
+                    path.write_bytes(await r.read())
+                    return
+                log.warning("Rasm xato %s (urinish %s)", r.status, attempt + 1)
+        except Exception as e:  # noqa: BLE001
+            log.warning("Rasm xatosi: %s", e)
+        await asyncio.sleep(3)
+    raise RuntimeError("Rasm yaratib bo'lmadi")
 
 
-@bot.message_handler(
-    func=lambda m: m.text == "🎬 Video yaratish"
-)
-def video_button(message):
-    generate_video_for_user(
-        message.chat.id,
-        message.from_user.id
+# ---------- 3. OVOZ ----------
+async def make_voice(text: str, voice: str, path: Path):
+    await edge_tts.Communicate(text, voice).save(str(path))
+
+
+# ---------- 4. MONTAJ ----------
+def audio_duration(path: Path) -> float:
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=nw=1:nk=1", str(path)],
+        capture_output=True, text=True, check=True,
+    )
+    return float(out.stdout.strip())
+
+
+def build_scene_clip(img: Path, audio: Path, out: Path):
+    dur = audio_duration(audio) + 0.4
+    frames = int(dur * FPS)
+    vf = (
+        f"scale={WIDTH * 2}:{HEIGHT * 2}:force_original_aspect_ratio=increase,"
+        f"crop={WIDTH * 2}:{HEIGHT * 2},"
+        f"zoompan=z='min(zoom+0.0007,1.25)':d={frames}"
+        f":x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s={WIDTH}x{HEIGHT}:fps={FPS},"
+        "format=yuv420p"
+    )
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", str(img), "-i", str(audio),
+         "-vf", vf, "-af", "apad", "-t", f"{dur:.2f}",
+         "-c:v", "libx264", "-preset", "veryfast", "-c:a", "aac",
+         "-ar", "44100", "-ac", "2", str(out)],
+        capture_output=True, check=True,
     )
 
 
-# ==============================
-# OVOZ YARATISH
-# ==============================
+def concat_clips(clips: list[Path], out: Path, workdir: Path):
+    lst = workdir / "list.txt"
+    lst.write_text("".join(f"file '{c.as_posix()}'\n" for c in clips))
+    subprocess.run(
+        ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(lst),
+         "-c", "copy", str(out)],
+        capture_output=True, check=True,
+    )
 
-@bot.message_handler(
-    func=lambda m: m.text == "🎙 Ovoz yaratish"
-)
-def voice_button(message):
-    user_id = message.from_user.id
-    session = get_session(user_id)
 
-    if not session["story"]:
-        bot.send_message(
-            message.chat.id,
-            "📖 Avval hikoya yuboring yoki yarating."
-        )
+# ---------- BOT ----------
+@dp.message(CommandStart())
+async def start(m: Message):
+    await m.answer(
+        "Salom! Menga mavzu yozing, men hikoya, rasm va ovozni birlashtirib video qilib beraman.\n\n"
+        "Masalan: Uzoq orolda yashagan kichkina robot\n\n"
+        "Til: /lang uz | ru | en (hozirgi: "
+        f"{user_lang.get(m.from_user.id, 'uz')})"
+    )
+
+
+@dp.message(Command("lang"))
+async def lang(m: Message):
+    arg = (m.text or "").split(maxsplit=1)[1:] 
+    code = arg[0].strip().lower() if arg else ""
+    if code not in LANGS:
+        await m.answer("Foydalanish: /lang uz  yoki  /lang ru  yoki  /lang en")
         return
+    user_lang[m.from_user.id] = code
+    await m.answer(f"Til o'zgartirildi: {code}")
 
-    try:
-        voice_path = os.path.join(
-            WORK_DIR,
-            f"voice_only_{time.time_ns()}.mp3"
-        )
 
-        gTTS(
-            text=session["story"][:4000],
-            lang="uz"
-        ).save(voice_path)
+@dp.message()
+async def handle_topic(m: Message):
+    topic = (m.text or "").strip()
+    if not topic or topic.startswith("/"):
+        return
+    lang_code = user_lang.get(m.from_user.id, "uz")
+    status = await m.answer("Navbatda...")
 
-        with open(voice_path, "rb") as voice_file:
-            bot.send_audio(
-                message.chat.id,
-                voice_file,
-                title="Hikoya ovozi"
+    async with job_limit:
+        workdir = Path(tempfile.mkdtemp(prefix="storybot_"))
+        try:
+            await status.edit_text("1/4 Hikoya yozilmoqda...")
+            story = await make_story(topic, lang_code)
+            scenes = story["scenes"]
+
+            await status.edit_text("2/4 Rasmlar va ovozlar yaratilmoqda...")
+            voice = LANGS[lang_code]["voice"]
+            async with aiohttp.ClientSession() as session:
+                tasks = []
+                for i, s in enumerate(scenes):
+                    tasks.append(make_image(session, s["image_prompt"], workdir / f"{i}.jpg", seed=i + 7))
+                    tasks.append(make_voice(s["narration"], voice, workdir / f"{i}.mp3"))
+                await asyncio.gather(*tasks)
+
+            await status.edit_text("3/4 Video montaj qilinmoqda...")
+            clips = []
+            for i in range(len(scenes)):
+                clip = workdir / f"clip{i}.mp4"
+                await asyncio.to_thread(build_scene_clip, workdir / f"{i}.jpg", workdir / f"{i}.mp3", clip)
+                clips.append(clip)
+            final = workdir / "final.mp4"
+            await asyncio.to_thread(concat_clips, clips, final, workdir)
+
+            await status.edit_text("4/4 Yuborilmoqda...")
+            await m.answer_video(
+                FSInputFile(final),
+                caption=story.get("title", topic)[:200],
+                width=WIDTH, height=HEIGHT, supports_streaming=True,
             )
-
-        os.remove(voice_path)
-
-    except Exception:
-        logging.exception("Ovoz yaratishda xatolik")
-
-        bot.send_message(
-            message.chat.id,
-            "❌ Ovoz yaratilmadi. Internet aloqasini tekshiring."
-        )
+            await status.delete()
+        except Exception as e:  # noqa: BLE001
+            log.exception("Xato")
+            await status.edit_text(f"Xatolik yuz berdi: {e}\nQayta urinib ko'ring.")
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
 
 
-# ==============================
-# BOTNI ISHGA TUSHIRISH
-# ==============================
+async def main():
+    bot = Bot(BOT_TOKEN)
+    await dp.start_polling(bot)
+
 
 if __name__ == "__main__":
-    logging.info("AIStoryStudioProBot ishga tushmoqda...")
-
-    while True:
-        try:
-            bot.infinity_polling(
-                skip_pending=True,
-                timeout=30,
-                long_polling_timeout=30
-            )
-        except Exception:
-            logging.exception("Bot polling xatosi")
-            time.sleep(5)
+    asyncio.run(main())
