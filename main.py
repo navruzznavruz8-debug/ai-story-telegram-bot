@@ -8,17 +8,17 @@ bot = telebot.TeleBot(TOKEN)
 def start(message):
     bot.reply_to(
         message,
-        "Salom! 🎬 AI Story Studio botiga xush kelibsiz!\n\n"
-        "Menga hikoyangizni va rasmlaringizni yuboring.\n"
-        "Hozircha bot sozlanmoqda."
+        "Salom! AI Hikoya botiga xush kelibsiz!\n"
+        "Avval hikoyangiz matnini yuboring, "
+        "keyin rasmlaringizni yuborishingiz mumkin."
     )
 
 @bot.message_handler(content_types=["text"])
 def story(message):
     bot.reply_to(
         message,
-        "📖 Hikoyangiz qabul qilindi!\n"
-        "Rasmlarni ham yuborishingiz mumkin."
+        "Hikoyangiz qabul qilindi!\n"
+        "Video yaratish funksiyalarini keyingi bosqichda ulaymiz."
     )
 
 bot.infinity_polling()
