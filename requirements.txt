@@ -1,5 +1,5 @@
-pyTelegramBotAPI
-Pillow
-gTTS
-moviepy==1.0.3
-imageio-ffmpeg
+aiogram>=3.13
+anthropic>=0.40
+edge-tts>=6.1.12
+aiohttp>=3.9
+python-dotenv>=1.0
